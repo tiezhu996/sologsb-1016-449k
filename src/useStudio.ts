@@ -1,44 +1,80 @@
-import { computed, ref, watch } from 'vue'
+import { computed, ref } from 'vue'
+import { applyMerge, clone, diffDocuments, planMerge, uid } from './patch'
 import { sampleDocument } from './sample'
-import type { Cue, CueKind, FrozenVersion, PendingChange, Scene, StudioDocument, StudioState, WarningItem } from './types'
+import {
+  PersistError,
+  clearCheckpoint,
+  loadDraftStore,
+  loadFrozen,
+  loadPatches,
+  migrateLegacyState,
+  recoverFromCheckpoint,
+  saveStores,
+  writeCheckpoint
+} from './storage'
+import type { Cue, CueKind, DraftStore, FrozenVersion, Patch, Scene, StudioDocument, WarningItem } from './types'
 
-const STORAGE_KEY = 'sologsb-1016-studio-v1'
-const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T
-const uid = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+interface Bootstrap {
+  draft: DraftStore
+  patches: Patch[]
+  frozen: FrozenVersion[]
+  recovered: boolean
+  migrated: boolean
+}
 
-function loadState(): StudioState {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (raw) {
-      const parsed = JSON.parse(raw) as StudioState
-      if (parsed.document?.scenes?.length) return parsed
+function bootstrap(): Bootstrap {
+  // 上次一批写入中途失败：先把检查点（原稿 + 原补丁）恢复回来
+  const recovered = recoverFromCheckpoint()
+  let draft = loadDraftStore()
+  let patches = loadPatches()
+  let frozen = loadFrozen()
+  let migrated = false
+  if (!draft) {
+    // 旧版只有整份快照：转成补丁继续用
+    const legacy = migrateLegacyState()
+    if (legacy) {
+      draft = legacy.draft
+      patches = legacy.patches
+      frozen = legacy.frozen
+      migrated = true
     }
-  } catch {
-    // A corrupt local draft should not prevent access to the built-in example.
   }
-  return {
-    document: clone(sampleDocument),
-    pending: [],
-    frozen: [],
-    updatedAt: new Date().toISOString()
+  if (!draft) {
+    draft = {
+      rev: 0,
+      document: clone(sampleDocument),
+      appliedBatches: [],
+      updatedAt: new Date().toISOString()
+    }
   }
+  return { draft, patches, frozen, recovered, migrated }
 }
 
 export function useStudio() {
-  const state = ref<StudioState>(loadState())
-  const selectedSceneId = ref(state.value.document.scenes[0]?.id ?? '')
+  const boot = bootstrap()
+  const draft = ref<DraftStore>(boot.draft)
+  const patches = ref<Patch[]>(boot.patches)
+  const frozen = ref<FrozenVersion[]>(boot.frozen)
+  const selectedSceneId = ref(draft.value.document.scenes[0]?.id ?? '')
   const selectedCueId = ref('')
-  const saveState = ref<'saved' | 'saving' | 'dirty'>('saved')
+  const saveState = ref<'saved' | 'saving' | 'error'>('saved')
+  const saveError = ref('')
+  const notice = ref(
+    boot.recovered
+      ? '检测到上次一批写入未完成，已从检查点恢复原稿与待确认补丁，未重复生效。'
+      : boot.migrated
+        ? '旧版整份快照已逐条转换为补丁，可继续接受或退回。'
+        : ''
+  )
   const undoStack = ref<StudioDocument[]>([])
   const redoStack = ref<StudioDocument[]>([])
-  let saveTimer: number | undefined
 
-  const selectedScene = computed(() => state.value.document.scenes.find((scene) => scene.id === selectedSceneId.value) ?? state.value.document.scenes[0])
+  const selectedScene = computed(() => draft.value.document.scenes.find((scene) => scene.id === selectedSceneId.value) ?? draft.value.document.scenes[0])
 
   function durationOfCue(cue: Cue): number {
     if (cue.manualDuration !== undefined) return cue.manualDuration
     if (cue.kind === 'sfx') {
-      return state.value.document.soundEffects.find((effect) => effect.id === cue.soundEffectId)?.duration ?? 6
+      return draft.value.document.soundEffects.find((effect) => effect.id === cue.soundEffectId)?.duration ?? 6
     }
     if (cue.kind === 'transition') return 3
     const pauses = (cue.text.match(/[，。！？；、…]/g)?.length ?? 0) * 0.22
@@ -50,23 +86,23 @@ export function useStudio() {
     return Number(scene.cues.reduce((total, cue) => total + durationOfCue(cue), 0).toFixed(1))
   }
 
-  const totalDuration = computed(() => state.value.document.scenes.reduce((total, scene) => total + durationOfScene(scene), 0))
-  const pendingChanges = computed(() => state.value.pending.filter((item) => item.status === 'pending'))
+  const totalDuration = computed(() => draft.value.document.scenes.reduce((total, scene) => total + durationOfScene(scene), 0))
+  const pendingChanges = computed(() => patches.value.filter((item) => item.status === 'pending' || item.status === 'conflict'))
 
   const warnings = computed<WarningItem[]>(() => {
     const result: WarningItem[] = []
-    for (const scene of state.value.document.scenes) {
+    for (const scene of draft.value.document.scenes) {
       const actorRoles = new Map<string, string[]>()
       for (const cue of scene.cues) {
         if (cue.kind === 'dialogue' && cue.characterId) {
-          const character = state.value.document.characters.find((item) => item.id === cue.characterId)
+          const character = draft.value.document.characters.find((item) => item.id === cue.characterId)
           if (character) {
             const roles = actorRoles.get(character.voiceActor) ?? []
             roles.push(character.name)
             actorRoles.set(character.voiceActor, roles)
           }
         }
-        if (cue.kind === 'sfx' && cue.soundEffectId && !state.value.document.soundEffects.some((effect) => effect.id === cue.soundEffectId)) {
+        if (cue.kind === 'sfx' && cue.soundEffectId && !draft.value.document.soundEffects.some((effect) => effect.id === cue.soundEffectId)) {
           result.push({
             id: `missing-${cue.id}`,
             type: 'missing-sfx',
@@ -106,50 +142,80 @@ export function useStudio() {
     return result
   })
 
+  /** 落盘当前内存状态；失败时检查点与原稿都还在存储里，可重试。 */
   function persist() {
-    state.value.updatedAt = new Date().toISOString()
     saveState.value = 'saving'
-    window.clearTimeout(saveTimer)
-    saveTimer = window.setTimeout(() => {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state.value))
+    try {
+      saveStores(draft.value, patches.value, frozen.value)
+      clearCheckpoint()
       saveState.value = 'saved'
-    }, 180)
+      saveError.value = ''
+    } catch (error) {
+      saveState.value = 'error'
+      saveError.value = error instanceof PersistError ? error.message : String(error)
+    }
   }
 
-  function commit(label: string, mutator: (document: StudioDocument) => void, note = '') {
-    const before = clone(state.value.document)
-    const document = clone(state.value.document)
-    mutator(document)
-    undoStack.value.push(before)
-    if (undoStack.value.length > 60) undoStack.value.shift()
-    redoStack.value = []
-    state.value.document = document
-    state.value.pending.unshift({
-      id: uid('change'),
+  /** 写入失败后重试：同一批内容原样重写，不会重复生效。 */
+  function retryPersist() {
+    persist()
+  }
+
+  /**
+   * 一批修改（一条补丁的提交 / 接受 / 退回 / 合入）的事务：
+   * 先写检查点留住原稿，再改内存，最后落盘并登记批次号。
+   * 同一批次号重试时直接跳过，保证不会重复生效。
+   */
+  function runBatch(batchId: string, label: string, mutate: () => void): boolean {
+    if (draft.value.appliedBatches.includes(batchId)) return false
+    writeCheckpoint({
+      batchId,
+      label,
+      savedAt: new Date().toISOString(),
+      draft: clone(draft.value),
+      patches: clone(patches.value),
+      frozen: clone(frozen.value)
+    })
+    mutate()
+    draft.value.appliedBatches = [...draft.value.appliedBatches, batchId].slice(-200)
+    draft.value.updatedAt = new Date().toISOString()
+    persist()
+    return true
+  }
+
+  function stagePatch(label: string, note: string, before: StudioDocument, after: StudioDocument) {
+    const ops = diffDocuments(before, after)
+    if (!ops.length) return
+    const patch: Patch = {
+      id: uid('patch'),
       label,
       note,
       createdAt: new Date().toISOString(),
-      status: 'pending',
-      before,
-      after: clone(document)
+      baseRev: draft.value.rev,
+      ops,
+      status: 'pending'
+    }
+    runBatch(patch.id, label, () => {
+      draft.value.document = clone(after)
+      draft.value.rev += 1
+      patches.value.unshift(patch)
+      if (patches.value.length > 120) patches.value = patches.value.slice(0, 120)
     })
-    if (state.value.pending.length > 80) state.value.pending = state.value.pending.slice(0, 80)
-    persist()
+  }
+
+  function commit(label: string, mutator: (document: StudioDocument) => void, note = '') {
+    const before = clone(draft.value.document)
+    const after = clone(before)
+    mutator(after)
+    if (JSON.stringify(before) === JSON.stringify(after)) return
+    undoStack.value.push(before)
+    if (undoStack.value.length > 60) undoStack.value.shift()
+    redoStack.value = []
+    stagePatch(label, note, before, after)
   }
 
   function replaceDocument(next: StudioDocument, label: string) {
-    const before = clone(state.value.document)
-    state.value.document = clone(next)
-    state.value.pending.unshift({
-      id: uid('change'),
-      label,
-      note: '',
-      createdAt: new Date().toISOString(),
-      status: 'pending',
-      before,
-      after: clone(next)
-    })
-    persist()
+    stagePatch(label, '', clone(draft.value.document), clone(next))
   }
 
   function updateProject(field: 'title' | 'subtitle' | 'targetDuration', value: string | number) {
@@ -160,7 +226,7 @@ export function useStudio() {
   }
 
   function updateScene(sceneId: string, field: keyof Scene, value: string | number) {
-    commit(`更新 ${state.value.document.scenes.find((scene) => scene.id === sceneId)?.code ?? '场次'} ${field}`, (document) => {
+    commit(`更新 ${draft.value.document.scenes.find((scene) => scene.id === sceneId)?.code ?? '场次'} ${field}`, (document) => {
       const scene = document.scenes.find((item) => item.id === sceneId)
       if (!scene) return
       if (field === 'durationLimit') scene.durationLimit = Number(value)
@@ -169,7 +235,7 @@ export function useStudio() {
   }
 
   function updateCue(cueId: string, field: keyof Cue, value: string | number | undefined) {
-    commit(`修改台词 ${state.value.document.scenes.flatMap((scene) => scene.cues).find((cue) => cue.id === cueId)?.text.slice(0, 12) ?? ''}`, (document) => {
+    commit(`修改台词 ${draft.value.document.scenes.flatMap((scene) => scene.cues).find((cue) => cue.id === cueId)?.text.slice(0, 12) ?? ''}`, (document) => {
       for (const scene of document.scenes) {
         const cue = scene.cues.find((item) => item.id === cueId)
         if (!cue) continue
@@ -183,7 +249,7 @@ export function useStudio() {
   }
 
   function addScene() {
-    const nextNumber = state.value.document.scenes.length + 1
+    const nextNumber = draft.value.document.scenes.length + 1
     const id = uid('scene')
     commit(`新增场次 S${String(nextNumber).padStart(2, '0')}`, (document) => {
       document.scenes.push({
@@ -201,12 +267,12 @@ export function useStudio() {
   }
 
   function deleteScene(sceneId: string) {
-    if (state.value.document.scenes.length <= 1) return
-    const scene = state.value.document.scenes.find((item) => item.id === sceneId)
+    if (draft.value.document.scenes.length <= 1) return
+    const scene = draft.value.document.scenes.find((item) => item.id === sceneId)
     commit(`删除场次 ${scene?.code ?? ''}`, (document) => {
       document.scenes = document.scenes.filter((item) => item.id !== sceneId)
     })
-    selectedSceneId.value = state.value.document.scenes[0].id
+    selectedSceneId.value = draft.value.document.scenes[0].id
   }
 
   function addCue(kind: CueKind, sceneId = selectedSceneId.value) {
@@ -249,65 +315,143 @@ export function useStudio() {
   }
 
   function moveScene(sceneId: string, direction: -1 | 1) {
-    const index = state.value.document.scenes.findIndex((scene) => scene.id === sceneId)
+    const index = draft.value.document.scenes.findIndex((scene) => scene.id === sceneId)
     const target = index + direction
-    if (index < 0 || target < 0 || target >= state.value.document.scenes.length) return
+    if (index < 0 || target < 0 || target >= draft.value.document.scenes.length) return
     commit('调整场次顺序', (document) => {
       const [scene] = document.scenes.splice(index, 1)
       document.scenes.splice(target, 0, scene)
     })
   }
 
-  function acceptChange(changeId: string) {
-    const change = state.value.pending.find((item) => item.id === changeId)
-    if (!change || change.status !== 'pending') return
-    change.status = 'accepted'
+  /** 接受：把补丁按台词 / 音效逐条合入当前草稿；同一条被双方改过则挂起待选定。 */
+  function acceptChange(patchId: string) {
+    const patch = patches.value.find((item) => item.id === patchId)
+    if (!patch || patch.status !== 'pending') return
+    const { clean, conflicts } = planMerge(draft.value.document, patch, 'accept')
+    if (conflicts.length) {
+      runBatch(uid('batch'), `合入冲突：${patch.label}`, () => {
+        patch.status = 'conflict'
+        patch.merge = { action: 'accept', conflicts }
+      })
+      return
+    }
+    runBatch(uid('batch'), `接受：${patch.label}`, () => {
+      if (clean.length) {
+        draft.value.document = applyMerge(draft.value.document, patch, clean, [])
+        draft.value.rev += 1
+      }
+      patch.status = 'accepted'
+      patch.resolvedAt = new Date().toISOString()
+    })
+  }
+
+  /** 退回：只撤回这条补丁触及的内容，不再整稿回退、不连带其他补丁。 */
+  function rejectChange(patchId: string) {
+    const patch = patches.value.find((item) => item.id === patchId)
+    if (!patch || patch.status !== 'pending') return
+    const { clean, conflicts } = planMerge(draft.value.document, patch, 'reject')
+    if (conflicts.length) {
+      runBatch(uid('batch'), `退回冲突：${patch.label}`, () => {
+        patch.status = 'conflict'
+        patch.merge = { action: 'reject', conflicts }
+      })
+      return
+    }
+    runBatch(uid('batch'), `退回：${patch.label}`, () => {
+      if (clean.length) {
+        draft.value.document = applyMerge(draft.value.document, patch, clean, [])
+        draft.value.rev += 1
+      }
+      patch.status = 'rejected'
+      patch.resolvedAt = new Date().toISOString()
+    })
+  }
+
+  /** 导演在冲突条目上选定一边；全部选定前合入暂停。 */
+  function resolveConflict(patchId: string, opIndex: number, choice: 'current' | 'incoming') {
+    const patch = patches.value.find((item) => item.id === patchId)
+    const conflict = patch?.merge?.conflicts.find((item) => item.opIndex === opIndex)
+    if (!patch || !conflict) return
+    conflict.choice = choice
     persist()
   }
 
-  function rejectChange(changeId: string) {
-    const index = state.value.pending.findIndex((item) => item.id === changeId && item.status === 'pending')
-    if (index < 0) return
-    const change = state.value.pending[index]
-    undoStack.value.push(clone(state.value.document))
-    state.value.document = clone(change.before)
-    for (let i = 0; i <= index; i += 1) {
-      if (state.value.pending[i].status === 'pending') state.value.pending[i].status = 'rejected'
+  /** 全部选定后完成合入：按导演选择写入冲突项，干净项照常应用。 */
+  function finalizeMerge(patchId: string) {
+    const patch = patches.value.find((item) => item.id === patchId)
+    if (!patch || patch.status !== 'conflict' || !patch.merge) return
+    const merge = patch.merge
+    if (merge.conflicts.some((conflict) => !conflict.choice)) return
+    // 以最新草稿重新规划，沿用已做的选择；出现新冲突则继续挂起
+    const { clean, conflicts } = planMerge(draft.value.document, patch, merge.action)
+    for (const conflict of conflicts) {
+      const chosen = merge.conflicts.find(
+        (item) => item.opIndex === conflict.opIndex && JSON.stringify(item.incoming) === JSON.stringify(conflict.incoming)
+      )
+      if (chosen?.choice) conflict.choice = chosen.choice
     }
-    persist()
+    if (conflicts.some((conflict) => !conflict.choice)) {
+      runBatch(uid('batch'), `冲突更新：${patch.label}`, () => {
+        patch.merge = { ...merge, conflicts }
+      })
+      return
+    }
+    runBatch(uid('batch'), `完成合入：${patch.label}`, () => {
+      draft.value.document = applyMerge(draft.value.document, patch, clean, conflicts)
+      draft.value.rev += 1
+      patch.status = merge.action === 'accept' ? 'accepted' : 'rejected'
+      patch.resolvedAt = new Date().toISOString()
+      delete patch.merge
+    })
   }
 
   function acceptAll() {
-    for (const change of state.value.pending) {
-      if (change.status === 'pending') change.status = 'accepted'
-    }
-    persist()
+    const queue = patches.value.filter((item) => item.status === 'pending').reverse()
+    if (!queue.length) return
+    runBatch(uid('batch'), '全部接受', () => {
+      for (const patch of queue) {
+        const { clean, conflicts } = planMerge(draft.value.document, patch, 'accept')
+        if (conflicts.length) {
+          patch.status = 'conflict'
+          patch.merge = { action: 'accept', conflicts }
+          continue
+        }
+        if (clean.length) {
+          draft.value.document = applyMerge(draft.value.document, patch, clean, [])
+          draft.value.rev += 1
+        }
+        patch.status = 'accepted'
+        patch.resolvedAt = new Date().toISOString()
+      }
+    })
   }
 
   function undo() {
     const previous = undoStack.value.pop()
     if (!previous) return
-    redoStack.value.push(clone(state.value.document))
+    redoStack.value.push(clone(draft.value.document))
     replaceDocument(previous, '撤销上一步修改')
   }
 
   function redo() {
     const next = redoStack.value.pop()
     if (!next) return
-    undoStack.value.push(clone(state.value.document))
+    undoStack.value.push(clone(draft.value.document))
     replaceDocument(next, '重做修改')
   }
 
   function freeze(name: string): FrozenVersion {
     const version: FrozenVersion = {
       id: uid('version'),
-      name: name.trim() || `制作稿 v${state.value.frozen.length + 1}`,
+      name: name.trim() || `制作稿 v${frozen.value.length + 1}`,
       createdAt: new Date().toISOString(),
-      document: clone(state.value.document),
+      document: clone(draft.value.document),
       totalDuration: totalDuration.value
     }
-    state.value.frozen.unshift(version)
-    persist()
+    runBatch(uid('batch'), `冻结 ${version.name}`, () => {
+      frozen.value.unshift(version)
+    })
     return version
   }
 
@@ -359,13 +503,13 @@ export function useStudio() {
       const next = clone(sampleDocument)
       Object.assign(document, next)
     })
-    selectedSceneId.value = state.value.document.scenes[0]?.id ?? ''
+    selectedSceneId.value = draft.value.document.scenes[0]?.id ?? ''
   }
 
-  watch(state, persist, { deep: true })
-
   return {
-    state,
+    draft,
+    patches,
+    frozen,
     selectedSceneId,
     selectedCueId,
     selectedScene,
@@ -373,6 +517,8 @@ export function useStudio() {
     pendingChanges,
     warnings,
     saveState,
+    saveError,
+    notice,
     durationOfCue,
     durationOfScene,
     updateProject,
@@ -386,6 +532,8 @@ export function useStudio() {
     moveScene,
     acceptChange,
     rejectChange,
+    resolveConflict,
+    finalizeMerge,
     acceptAll,
     undo,
     redo,
@@ -393,6 +541,7 @@ export function useStudio() {
     downloadVersion,
     makeScript,
     resetSample,
-    persist
+    persist,
+    retryPersist
   }
 }

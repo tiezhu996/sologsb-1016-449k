@@ -16,18 +16,22 @@ import {
   NTabs,
   NTag
 } from 'naive-ui'
+import { summarizeOps } from './patch'
 import { useStudio } from './useStudio'
-import type { Cue, CueKind, Rate } from './types'
+import type { Cue, CueKind, Patch, PatchOp, Rate, SceneMeta } from './types'
 
 const studio = useStudio()
 const {
-  state,
+  draft,
+  patches,
+  frozen,
   selectedSceneId,
   selectedScene,
   totalDuration,
   pendingChanges,
   warnings,
   saveState,
+  notice,
   durationOfCue,
   durationOfScene,
   updateProject,
@@ -41,12 +45,15 @@ const {
   moveScene,
   acceptChange,
   rejectChange,
+  resolveConflict,
+  finalizeMerge,
   acceptAll,
   undo,
   redo,
   freeze,
   downloadVersion,
-  resetSample
+  resetSample,
+  retryPersist
 } = studio
 
 const dragCueId = ref('')
@@ -66,8 +73,8 @@ const rateOptions: Array<{ label: string; value: Rate }> = [
   { label: '偏快 1.1×', value: 1.1 },
   { label: '快 1.2×', value: 1.2 }
 ]
-const characterOptions = computed(() => state.value.document.characters.map((item) => ({ label: `${item.name} / ${item.voiceActor}`, value: item.id })))
-const effectOptions = computed(() => state.value.document.soundEffects.map((item) => ({ label: `${item.name} (${item.duration}s)`, value: item.id })))
+const characterOptions = computed(() => draft.value.document.characters.map((item) => ({ label: `${item.name} / ${item.voiceActor}`, value: item.id })))
+const effectOptions = computed(() => draft.value.document.soundEffects.map((item) => ({ label: `${item.name} (${item.duration}s)`, value: item.id })))
 const themeOverrides = {
   common: {
     primaryColor: '#73daca',
@@ -89,11 +96,14 @@ const themeOverrides = {
 const projectMinutes = computed(() => `${Math.floor(totalDuration.value / 60)}:${String(Math.round(totalDuration.value % 60)).padStart(2, '0')}`)
 const pendingCount = computed(() => pendingChanges.value.length)
 const warningCount = computed(() => warnings.value.length)
-const saveLabel = computed(() => saveState.value === 'saved' ? '已保存到本机' : '正在保存…')
+const saveLabel = computed(() => {
+  if (saveState.value === 'error') return '写入失败 · 检查点与原稿已保留'
+  return saveState.value === 'saved' ? '已保存到本机' : '正在保存…'
+})
 
 function cueName(cue: Cue) {
-  if (cue.kind === 'dialogue') return state.value.document.characters.find((item) => item.id === cue.characterId)?.name ?? '未指定角色'
-  if (cue.kind === 'sfx') return state.value.document.soundEffects.find((item) => item.id === cue.soundEffectId)?.name ?? '缺失音效'
+  if (cue.kind === 'dialogue') return draft.value.document.characters.find((item) => item.id === cue.characterId)?.name ?? '未指定角色'
+  if (cue.kind === 'sfx') return draft.value.document.soundEffects.find((item) => item.id === cue.soundEffectId)?.name ?? '缺失音效'
   return '转场'
 }
 
@@ -114,13 +124,13 @@ function goToScene(sceneId: string) {
 
 function changeCueKind(cue: Cue, kind: CueKind) {
   updateCue(cue.id, 'kind', kind)
-  if (kind === 'dialogue' && !cue.characterId) updateCue(cue.id, 'characterId', state.value.document.characters[0]?.id)
-  if (kind === 'sfx' && !cue.soundEffectId) updateCue(cue.id, 'soundEffectId', state.value.document.soundEffects[0]?.id)
+  if (kind === 'dialogue' && !cue.characterId) updateCue(cue.id, 'characterId', draft.value.document.characters[0]?.id)
+  if (kind === 'sfx' && !cue.soundEffectId) updateCue(cue.id, 'soundEffectId', draft.value.document.soundEffects[0]?.id)
   if (kind === 'transition') updateCue(cue.id, 'transition', cue.transition || '淡出')
 }
 
 function openFreeze() {
-  freezeName.value = `制作稿 v${state.value.frozen.length + 1}`
+  freezeName.value = `制作稿 v${frozen.value.length + 1}`
   showFreezeModal.value = true
 }
 
@@ -128,6 +138,93 @@ function confirmFreeze() {
   const version = freeze(freezeName.value)
   showFreezeModal.value = false
   downloadVersion(version)
+}
+
+function dismissNotice() {
+  notice.value = ''
+}
+
+/* ---- 待确认补丁展示 ---- */
+
+const statusMeta: Record<Patch['status'], { label: string; type: 'default' | 'info' | 'success' | 'warning' | 'error' }> = {
+  pending: { label: '待确认', type: 'info' },
+  conflict: { label: '冲突待选定', type: 'warning' },
+  accepted: { label: '已接受', type: 'success' },
+  rejected: { label: '已退回', type: 'default' }
+}
+
+function opChips(patch: Patch) {
+  const summary = summarizeOps(patch.ops)
+  const chips: string[] = []
+  if (summary.dialogue) chips.push(`台词 ${summary.dialogue}`)
+  if (summary.sfx) chips.push(`音效 ${summary.sfx}`)
+  if (summary.transition) chips.push(`转场 ${summary.transition}`)
+  if (summary.scene) chips.push(`场次 ${summary.scene}`)
+  if (summary.order) chips.push(`顺序 ${summary.order}`)
+  if (summary.project) chips.push(`项目 ${summary.project}`)
+  return chips
+}
+
+const mergeConflicts = (patch: Patch) => patch.merge?.conflicts ?? []
+const mergeActionLabel = (patch: Patch) => (patch.merge?.action === 'reject' ? '退回' : '接受')
+const incomingLabel = (patch: Patch) => (patch.merge?.action === 'reject' ? '退回目标' : '补丁版本')
+const allChosen = (patch: Patch) => mergeConflicts(patch).every((conflict) => conflict.choice)
+
+function opTitle(op: PatchOp): string {
+  switch (op.kind) {
+    case 'project-set':
+      return `项目${op.field === 'title' ? '标题' : op.field === 'subtitle' ? '副标题' : '目标时长'}`
+    case 'scene-set':
+      return `场次 ${op.before?.code ?? op.after?.code ?? ''}`
+    case 'scene-order':
+      return '场次顺序'
+    case 'cue-set': {
+      const cue = op.after ?? op.before
+      const kind = cue?.kind === 'dialogue' ? '台词' : cue?.kind === 'sfx' ? '音效' : '转场'
+      return `${kind}｜${cue?.text.slice(0, 18) || op.cueId}`
+    }
+    case 'cue-order':
+      return '台词与音效顺序'
+  }
+}
+
+function cueLines(cue: Cue): string[] {
+  if (cue.kind === 'dialogue') {
+    const role = draft.value.document.characters.find((item) => item.id === cue.characterId)?.name ?? '未指定角色'
+    return [`${role}｜${cue.emotion || '自然'}｜语速 ${cue.rate}`, cue.text]
+  }
+  if (cue.kind === 'sfx') {
+    const effect = draft.value.document.soundEffects.find((item) => item.id === cue.soundEffectId)?.name ?? '缺失音效'
+    return [`音效｜${effect}`, cue.text]
+  }
+  return [`转场｜${cue.transition || '未填写'}`, cue.text]
+}
+
+function findCueText(cueId: string) {
+  for (const scene of draft.value.document.scenes) {
+    const cue = scene.cues.find((item) => item.id === cueId)
+    if (cue) return cue.text.slice(0, 16) || cue.id
+  }
+  return cueId
+}
+
+/** 把冲突一侧的值渲染成可读行。 */
+function valueLines(op: PatchOp, value: unknown): string[] {
+  if (value === null || value === undefined) return ['（不存在 / 已删除）']
+  switch (op.kind) {
+    case 'project-set':
+      return [String(value)]
+    case 'scene-set': {
+      const meta = value as SceneMeta
+      return [`${meta.code}｜${meta.title}`, `场景：${meta.location} / ${meta.timeOfDay}`, `转场：${meta.transition}｜限额 ${meta.durationLimit}s`]
+    }
+    case 'scene-order':
+      return (value as string[]).map((id, index) => `${index + 1}. ${draft.value.document.scenes.find((scene) => scene.id === id)?.code ?? id}`)
+    case 'cue-set':
+      return cueLines(value as Cue)
+    case 'cue-order':
+      return (value as string[]).map((id, index) => `${index + 1}. ${findCueText(id)}`)
+  }
 }
 
 function onKeydown(event: KeyboardEvent) {
@@ -149,9 +246,9 @@ function onKeydown(event: KeyboardEvent) {
     moveScene(selectedScene.value.id, event.key === 'ArrowUp' ? -1 : 1)
   }
   if (event.key === '[' || event.key === ']') {
-    const index = state.value.document.scenes.findIndex((scene) => scene.id === selectedScene.value?.id)
+    const index = draft.value.document.scenes.findIndex((scene) => scene.id === selectedScene.value?.id)
     const next = event.key === '[' ? index - 1 : index + 1
-    if (state.value.document.scenes[next]) selectedSceneId.value = state.value.document.scenes[next].id
+    if (draft.value.document.scenes[next]) selectedSceneId.value = draft.value.document.scenes[next].id
   }
 }
 
@@ -171,33 +268,39 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
           </div>
         </div>
         <div class="project-fields">
-          <n-input :value="state.document.title" aria-label="项目标题" @update:value="updateProject('title', $event)" />
-          <n-input :value="state.document.subtitle" aria-label="项目副标题" @update:value="updateProject('subtitle', $event)" />
+          <n-input :value="draft.document.title" aria-label="项目标题" @update:value="updateProject('title', $event)" />
+          <n-input :value="draft.document.subtitle" aria-label="项目副标题" @update:value="updateProject('subtitle', $event)" />
         </div>
         <div class="top-actions">
-          <span class="save-state">{{ saveLabel }}</span>
+          <span class="save-state" :class="{ error: saveState === 'error' }">{{ saveLabel }}</span>
+          <n-button v-if="saveState === 'error'" size="small" type="error" secondary @click="retryPersist">重试保存</n-button>
           <n-button quaternary @click="undo">撤销 ⌘Z</n-button>
           <n-button quaternary @click="redo">重做 ⇧⌘Z</n-button>
           <n-button type="primary" @click="openFreeze">冻结并导出</n-button>
         </div>
       </header>
 
+      <div v-if="notice" class="notice-banner">
+        <span>{{ notice }}</span>
+        <button class="notice-close" @click="dismissNotice">知道了</button>
+      </div>
+
       <section class="summary-strip">
         <div class="metric">
           <span>预计总时长</span>
           <strong>{{ projectMinutes }}</strong>
-          <small>{{ totalDuration.toFixed(1) }} / {{ state.document.targetDuration }} 秒</small>
+          <small>{{ totalDuration.toFixed(1) }} / {{ draft.document.targetDuration }} 秒</small>
         </div>
         <div class="target-control">
           <n-progress
             type="line"
-            :percentage="Math.min(100, Number(((totalDuration / state.document.targetDuration) * 100).toFixed(1)))"
+            :percentage="Math.min(100, Number(((totalDuration / draft.document.targetDuration) * 100).toFixed(1)))"
             :height="8"
             :show-indicator="false"
-            :status="totalDuration > state.document.targetDuration ? 'error' : 'success'"
+            :status="totalDuration > draft.document.targetDuration ? 'error' : 'success'"
           />
           <n-input-number
-            :value="state.document.targetDuration"
+            :value="draft.document.targetDuration"
             size="small"
             :min="30"
             :step="10"
@@ -207,7 +310,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
           </n-input-number>
         </div>
         <div class="metric compact">
-          <span>场次</span><strong>{{ state.document.scenes.length }}</strong>
+          <span>场次</span><strong>{{ draft.document.scenes.length }}</strong>
         </div>
         <div class="metric compact">
           <span>待确认</span><strong class="accent">{{ pendingCount }}</strong>
@@ -228,7 +331,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
           </div>
           <div class="scene-list">
             <button
-              v-for="(scene, index) in state.document.scenes"
+              v-for="(scene, index) in draft.document.scenes"
               :key="scene.id"
               class="scene-item"
               :class="{ active: scene.id === selectedSceneId, warning: sceneStatus(scene.id) === 'warning' }"
@@ -356,7 +459,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
                     <strong>{{ warning.title }}</strong>
                   </div>
                   <p>{{ warning.detail }}</p>
-                  <n-button size="tiny" quaternary @click="goToScene(warning.sceneId)">定位到 {{ state.document.scenes.find((scene) => scene.id === warning.sceneId)?.code }}</n-button>
+                  <n-button size="tiny" quaternary @click="goToScene(warning.sceneId)">定位到 {{ draft.document.scenes.find((scene) => scene.id === warning.sceneId)?.code }}</n-button>
                 </div>
                 <n-empty v-if="!warnings.length" description="当前没有连续性问题" />
               </div>
@@ -364,27 +467,63 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 
             <n-tab-pane name="pending" :tab="`待确认 ${pendingCount}`">
               <div class="pending-toolbar">
-                <n-alert type="info" :show-icon="false">每次编辑都会形成草稿记录。退回较早记录时，其上方尚未确认的草稿会一并撤销。</n-alert>
+                <n-alert type="info" :show-icon="false">每次编辑形成一条补丁，按台词 / 音效逐条合入，退回不影响其他修改。同一条内容被双方改过时会并排列出，由导演选定后才继续。</n-alert>
               </div>
               <div class="review-list">
-                <div v-for="change in state.pending.filter((item) => item.status === 'pending')" :key="change.id" class="pending-card">
+                <div v-for="patch in pendingChanges" :key="patch.id" class="pending-card" :class="{ conflicted: patch.status === 'conflict' }">
                   <div class="pending-meta">
-                    <strong>{{ change.label }}</strong>
-                    <span>{{ new Date(change.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) }}</span>
+                    <strong>{{ patch.label }}</strong>
+                    <n-tag size="tiny" :type="statusMeta[patch.status].type" :bordered="false">{{ statusMeta[patch.status].label }}</n-tag>
                   </div>
-                  <p v-if="change.note">{{ change.note }}</p>
-                  <div class="pending-actions">
-                    <n-button size="small" type="primary" @click="acceptChange(change.id)">接受</n-button>
-                    <n-button size="small" tertiary type="warning" @click="rejectChange(change.id)">退回</n-button>
+                  <div class="patch-detail">
+                    <span>基于版本 #{{ patch.baseRev }}</span>
+                    <span>{{ new Date(patch.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) }}</span>
+                    <n-tag v-for="chip in opChips(patch)" :key="chip" size="tiny" :bordered="false" class="op-chip">{{ chip }}</n-tag>
+                  </div>
+                  <p v-if="patch.note">{{ patch.note }}</p>
+
+                  <template v-if="patch.status === 'conflict'">
+                    <n-alert type="warning" :show-icon="false" class="conflict-alert">
+                      双方改过同一条内容，不会直接覆盖。逐条选定要保留的版本，全部选定后才能{{ mergeActionLabel(patch) }}。
+                    </n-alert>
+                    <div v-for="conflict in mergeConflicts(patch)" :key="conflict.opIndex" class="conflict-item">
+                      <div class="conflict-title">{{ opTitle(patch.ops[conflict.opIndex]) }}</div>
+                      <div class="conflict-grid">
+                        <div class="conflict-side" :class="{ chosen: conflict.choice === 'current' }">
+                          <div class="side-head">
+                            <span>当前草稿</span>
+                            <n-button size="tiny" :type="conflict.choice === 'current' ? 'primary' : 'default'" secondary @click="resolveConflict(patch.id, conflict.opIndex, 'current')">保留这边</n-button>
+                          </div>
+                          <p v-for="(line, lineIndex) in valueLines(patch.ops[conflict.opIndex], conflict.current)" :key="lineIndex">{{ line }}</p>
+                        </div>
+                        <div class="conflict-side" :class="{ chosen: conflict.choice === 'incoming' }">
+                          <div class="side-head">
+                            <span>{{ incomingLabel(patch) }}</span>
+                            <n-button size="tiny" :type="conflict.choice === 'incoming' ? 'primary' : 'default'" secondary @click="resolveConflict(patch.id, conflict.opIndex, 'incoming')">保留这边</n-button>
+                          </div>
+                          <p v-for="(line, lineIndex) in valueLines(patch.ops[conflict.opIndex], conflict.incoming)" :key="lineIndex">{{ line }}</p>
+                        </div>
+                      </div>
+                    </div>
+                    <div class="pending-actions">
+                      <n-button size="small" type="primary" :disabled="!allChosen(patch)" @click="finalizeMerge(patch.id)">
+                        完成{{ mergeActionLabel(patch) }}
+                      </n-button>
+                    </div>
+                  </template>
+
+                  <div v-else class="pending-actions">
+                    <n-button size="small" type="primary" @click="acceptChange(patch.id)">接受</n-button>
+                    <n-button size="small" tertiary type="warning" @click="rejectChange(patch.id)">退回</n-button>
                   </div>
                 </div>
                 <n-empty v-if="!pendingCount" description="所有修改都已确认" />
               </div>
             </n-tab-pane>
 
-            <n-tab-pane name="versions" :tab="`冻结 ${state.frozen.length}`">
+            <n-tab-pane name="versions" :tab="`冻结 ${frozen.length}`">
               <div class="review-list">
-                <div v-for="version in state.frozen" :key="version.id" class="version-card">
+                <div v-for="version in frozen" :key="version.id" class="version-card">
                   <div>
                     <strong>{{ version.name }}</strong>
                     <span>{{ new Date(version.createdAt).toLocaleString('zh-CN') }}</span>
@@ -392,7 +531,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
                   </div>
                   <n-button size="small" type="primary" secondary @click="downloadVersion(version)">导出稿</n-button>
                 </div>
-                <n-empty v-if="!state.frozen.length" description="冻结后生成只读制作稿" />
+                <n-empty v-if="!frozen.length" description="冻结后生成只读制作稿" />
               </div>
             </n-tab-pane>
           </n-tabs>

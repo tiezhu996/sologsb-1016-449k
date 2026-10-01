@@ -86,9 +86,26 @@ h3 { margin: 3px 0 0; font-size: 21px; }
 .warning-card p, .pending-card p { margin: 9px 0; color: #8996aa; font-size: 12px; line-height: 1.55; }
 .pending-toolbar { margin-bottom: 10px; }
 .pending-meta, .version-card { display: flex; justify-content: space-between; gap: 12px; }
+.pending-meta { align-items: center; }
 .pending-meta strong { font-size: 12px; }
 .pending-meta span, .version-card span, .version-card small { color: #707d93; font-size: 11px; }
 .pending-actions { display: flex; gap: 8px; margin-top: 11px; }
+.pending-card.conflicted { border-color: rgba(255, 199, 119, .45); }
+.patch-detail { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 7px; color: #707d93; font-size: 11px; }
+.op-chip { font-size: 10px; }
+.conflict-alert { margin-top: 10px; }
+.conflict-item { margin-top: 10px; padding: 10px; border: 1px dashed #3a465c; border-radius: 9px; background: #101724; }
+.conflict-title { margin-bottom: 8px; color: #c8d3e6; font-size: 12px; font-weight: 700; }
+.conflict-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.conflict-side { padding: 9px 10px; border: 1px solid #2b3547; border-radius: 8px; background: #141b29; transition: border-color .15s ease; }
+.conflict-side.chosen { border-color: #73daca; box-shadow: 0 0 0 1px rgba(115, 218, 202, .35); }
+.conflict-side p { margin: 4px 0 0; color: #93a1b8; font-size: 11px; line-height: 1.55; word-break: break-all; }
+.side-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.side-head span { color: #7f8ca3; font-size: 11px; font-weight: 700; letter-spacing: .06em; }
+.save-state.error { color: #ff7a8a; }
+.notice-banner { display: flex; align-items: center; justify-content: center; gap: 14px; padding: 8px 18px; border-bottom: 1px solid #2c3648; background: rgba(255, 199, 119, .1); color: #ffd9a0; font-size: 12px; }
+.notice-close { padding: 2px 12px; border: 1px solid rgba(255, 217, 160, .4); border-radius: 99px; color: #ffd9a0; background: transparent; cursor: pointer; font-size: 11px; }
+.notice-close:hover { background: rgba(255, 217, 160, .12); }
 .version-card { align-items: center; }
 .version-card > div { display: grid; gap: 4px; }
 .dialog-card { width: min(460px, calc(100vw - 32px)); padding: 24px; border: 1px solid #2d394d; border-radius: 14px; background: #171e2c; box-shadow: 0 26px 80px rgba(0,0,0,.5); }

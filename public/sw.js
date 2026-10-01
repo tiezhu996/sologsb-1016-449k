@@ -1,4 +1,4 @@
-const CACHE = 'sologsb-1016-v1'
+const CACHE = 'sologsb-1016-v2'
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(['/', '/index.html'])))
   self.skipWaiting()

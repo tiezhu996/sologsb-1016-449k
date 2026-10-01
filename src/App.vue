@@ -10,6 +10,8 @@ import {
   NInputNumber,
   NModal,
   NProgress,
+  NRadioGroup,
+  NRadioButton,
   NSelect,
   NSpace,
   NTabPane,
@@ -22,6 +24,12 @@ import type { Cue, CueKind, Rate } from './types'
 const studio = useStudio()
 const {
   state,
+  revision,
+  meta,
+  checkpoints,
+  saveError,
+  conflictSession,
+  sessionResolvedAll,
   selectedSceneId,
   selectedScene,
   totalDuration,
@@ -42,11 +50,19 @@ const {
   acceptChange,
   rejectChange,
   acceptAll,
+  resolveConflict,
+  confirmConflictSession,
+  cancelConflictSession,
+  setRole,
+  dismissNotice,
+  dismissSaveError,
+  recoverCheckpoint,
   undo,
   redo,
   freeze,
   downloadVersion,
-  resetSample
+  resetSample,
+  patchLocations
 } = studio
 
 const dragCueId = ref('')
@@ -89,7 +105,12 @@ const themeOverrides = {
 const projectMinutes = computed(() => `${Math.floor(totalDuration.value / 60)}:${String(Math.round(totalDuration.value % 60)).padStart(2, '0')}`)
 const pendingCount = computed(() => pendingChanges.value.length)
 const warningCount = computed(() => warnings.value.length)
-const saveLabel = computed(() => saveState.value === 'saved' ? '已保存到本机' : '正在保存…')
+const saveLabel = computed(() => {
+  if (saveState.value === 'dirty') return '保存失败 · 已保留原稿与检查点'
+  return saveState.value === 'saved' ? '已保存到本机' : '正在保存…'
+})
+
+const authorLabel: Record<string, string> = { writer: '编剧', director: '导演' }
 
 function cueName(cue: Cue) {
   if (cue.kind === 'dialogue') return state.value.document.characters.find((item) => item.id === cue.characterId)?.name ?? '未指定角色'
@@ -126,6 +147,7 @@ function openFreeze() {
 
 function confirmFreeze() {
   const version = freeze(freezeName.value)
+  if (!version) return
   showFreezeModal.value = false
   downloadVersion(version)
 }
@@ -155,6 +177,17 @@ function onKeydown(event: KeyboardEvent) {
   }
 }
 
+const conflictTotal = computed(() => conflictSession.value?.items.reduce((sum, item) => sum + item.conflicts.length, 0) ?? 0)
+function resolutionOf(itemIndex: number, opIndex: number) {
+  return conflictSession.value?.items[itemIndex]?.resolutions.get(opIndex)
+}
+const conflictTitle = computed(() => (conflictSession.value?.context === 'reject' ? '退回冲突：该补丁涉及的内容又被修改' : '合入冲突：双方改了同一条内容'))
+const conflictHint = computed(() =>
+  conflictSession.value?.context === 'reject'
+    ? '左列是补丁基准原稿，中列是该补丁要退回的内容，右列是当前草稿。退回不会直接覆盖，请导演逐项选定。'
+    : '左列是补丁基准原稿，中列是补丁方修改，右列是当前草稿。两边都改了同一条，系统不会直接覆盖；请导演逐项选定后才能继续。'
+)
+
 onMounted(() => window.addEventListener('keydown', onKeydown))
 onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 </script>
@@ -169,24 +202,35 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
             <strong>声场制作台</strong>
             <span>RADIO DRAMA STUDIO</span>
           </div>
+          <n-radio-group :value="meta.role" size="small" class="role-switch" @update:value="setRole($event)">
+            <n-radio-button value="writer">编剧稿</n-radio-button>
+            <n-radio-button value="director">导演稿</n-radio-button>
+          </n-radio-group>
         </div>
         <div class="project-fields">
           <n-input :value="state.document.title" aria-label="项目标题" @update:value="updateProject('title', $event)" />
           <n-input :value="state.document.subtitle" aria-label="项目副标题" @update:value="updateProject('subtitle', $event)" />
         </div>
         <div class="top-actions">
-          <span class="save-state">{{ saveLabel }}</span>
+          <span class="save-state" :class="{ failed: saveState === 'dirty' }">{{ saveLabel }}</span>
           <n-button quaternary @click="undo">撤销 ⌘Z</n-button>
           <n-button quaternary @click="redo">重做 ⇧⌘Z</n-button>
           <n-button type="primary" @click="openFreeze">冻结并导出</n-button>
         </div>
       </header>
 
+      <n-alert v-if="meta.notice" class="banner-alert" type="info" :show-icon="true" closable @close="dismissNotice">
+        {{ meta.notice.text }}
+      </n-alert>
+      <n-alert v-if="saveError" class="banner-alert" type="error" :show-icon="true" closable @close="dismissSaveError">
+        {{ saveError }}　上一份原稿与检查点仍保留在本机，可在右侧「检查点」中恢复后重试。
+      </n-alert>
+
       <section class="summary-strip">
         <div class="metric">
           <span>预计总时长</span>
           <strong>{{ projectMinutes }}</strong>
-          <small>{{ totalDuration.toFixed(1) }} / {{ state.document.targetDuration }} 秒</small>
+          <small>{{ totalDuration.toFixed(1) }} / {{ state.document.targetDuration }} 秒 · 稿次 r{{ revision }}</small>
         </div>
         <div class="target-control">
           <n-progress
@@ -364,18 +408,26 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 
             <n-tab-pane name="pending" :tab="`待确认 ${pendingCount}`">
               <div class="pending-toolbar">
-                <n-alert type="info" :show-icon="false">每次编辑都会形成草稿记录。退回较早记录时，其上方尚未确认的草稿会一并撤销。</n-alert>
+                <n-alert type="info" :show-icon="false">每条修改都是独立补丁并记录基准稿次；接受或退回只合入该补丁涉及的台词与音效，不再整份覆盖。两边同时改过同一条时会并列双方版本，导演选定后才能继续。</n-alert>
               </div>
               <div class="review-list">
-                <div v-for="change in state.pending.filter((item) => item.status === 'pending')" :key="change.id" class="pending-card">
+                <div v-for="patch in state.pending.filter((item) => item.status === 'pending')" :key="patch.id" class="pending-card">
                   <div class="pending-meta">
-                    <strong>{{ change.label }}</strong>
-                    <span>{{ new Date(change.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) }}</span>
+                    <strong>{{ patch.label }}</strong>
+                    <span>{{ new Date(patch.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) }}</span>
                   </div>
-                  <p v-if="change.note">{{ change.note }}</p>
+                  <div class="patch-tags">
+                    <n-tag size="tiny" :bordered="false" :type="patch.author === 'writer' ? 'success' : 'info'">{{ authorLabel[patch.author] }}稿</n-tag>
+                    <n-tag size="tiny" :bordered="false">基于 r{{ patch.baseRevision }}</n-tag>
+                    <n-tag v-if="patch.migrated" size="tiny" :bordered="false" type="warning">旧快照迁移</n-tag>
+                  </div>
+                  <ul class="patch-locations">
+                    <li v-for="location in patchLocations(patch)" :key="location">{{ location }}</li>
+                  </ul>
+                  <p v-if="patch.note">{{ patch.note }}</p>
                   <div class="pending-actions">
-                    <n-button size="small" type="primary" @click="acceptChange(change.id)">接受</n-button>
-                    <n-button size="small" tertiary type="warning" @click="rejectChange(change.id)">退回</n-button>
+                    <n-button size="small" type="primary" @click="acceptChange(patch.id)">接受</n-button>
+                    <n-button size="small" tertiary type="warning" @click="rejectChange(patch.id)">退回</n-button>
                   </div>
                 </div>
                 <n-empty v-if="!pendingCount" description="所有修改都已确认" />
@@ -395,10 +447,77 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
                 <n-empty v-if="!state.frozen.length" description="冻结后生成只读制作稿" />
               </div>
             </n-tab-pane>
+
+            <n-tab-pane name="checkpoints" :tab="`检查点 ${checkpoints.length}`">
+              <div class="review-list">
+                <n-alert type="warning" :show-icon="false" class="cp-tip">写入失败后检查点与原稿会保留在这里；恢复会用检查点快照覆盖当前工作稿。</n-alert>
+                <div v-for="cp in [...checkpoints].reverse()" :key="cp.id" class="version-card checkpoint-card">
+                  <div>
+                    <strong>{{ cp.label }}</strong>
+                    <span>{{ new Date(cp.createdAt).toLocaleString('zh-CN') }}</span>
+                    <small>涉及分区：{{ Object.keys(cp.pre).join('、') }}</small>
+                  </div>
+                  <n-button size="small" secondary type="warning" @click="recoverCheckpoint(cp.id)">恢复</n-button>
+                </div>
+                <n-empty v-if="!checkpoints.length" description="还没有写入检查点" />
+              </div>
+            </n-tab-pane>
           </n-tabs>
         </aside>
       </main>
     </div>
+
+    <!-- 冲突解决：双方版本并列，导演选定后才能继续 -->
+    <n-modal :show="!!conflictSession" :mask-closable="false" :close-on-esc="false">
+      <div class="conflict-card">
+        <span class="eyebrow">MERGE CONFLICT · {{ conflictTotal }} 处</span>
+        <h2>{{ conflictTitle }}</h2>
+        <p>{{ conflictHint }}</p>
+
+        <div v-if="conflictSession" class="conflict-scroll">
+          <template v-for="(item, itemIndex) in conflictSession.items" :key="item.patch.id">
+            <div class="conflict-patch-head">
+              <strong>{{ item.patch.label }}</strong>
+              <n-tag size="tiny" :bordered="false" :type="item.patch.author === 'writer' ? 'success' : 'info'">{{ authorLabel[item.patch.author] }}稿 · r{{ item.patch.baseRevision }}</n-tag>
+            </div>
+            <div v-for="conflict in item.conflicts" :key="`${item.patch.id}-${conflict.opIndex}`" class="conflict-hunk">
+              <div class="conflict-location">{{ conflict.location }}</div>
+              <div class="conflict-columns">
+                <div class="conflict-option base readonly">
+                  <small>补丁基准（仅供对照）</small>
+                  <span>{{ conflict.baseText }}</span>
+                </div>
+                <button
+                  class="conflict-option patch-side"
+                  :class="{ chosen: resolutionOf(itemIndex, conflict.opIndex) === 'take-patch' }"
+                  @click="resolveConflict(itemIndex, conflict.opIndex, 'take-patch')"
+                >
+                  <small>{{ conflictSession.context === 'accept' ? `采纳补丁方（${authorLabel[item.patch.author]}）` : '执行退回（恢复基准）' }}</small>
+                  <span>{{ conflict.patchText }}</span>
+                  <em class="pick-hint">点此选定</em>
+                </button>
+                <button
+                  class="conflict-option live-side"
+                  :class="{ chosen: resolutionOf(itemIndex, conflict.opIndex) === 'keep-live' }"
+                  @click="resolveConflict(itemIndex, conflict.opIndex, 'keep-live')"
+                >
+                  <small>{{ conflictSession.context === 'accept' ? '保留当前草稿（另一路修改）' : '保留当前草稿（不退回此处）' }}</small>
+                  <span>{{ conflict.liveText }}</span>
+                  <em class="pick-hint">点此选定</em>
+                </button>
+              </div>
+            </div>
+          </template>
+        </div>
+
+        <div class="dialog-actions">
+          <n-button @click="cancelConflictSession">取消</n-button>
+          <n-button type="primary" :disabled="!sessionResolvedAll" @click="confirmConflictSession">
+            {{ sessionResolvedAll ? '按选定结果合入' : `还有冲突未选定（${conflictTotal}）` }}
+          </n-button>
+        </div>
+      </div>
+    </n-modal>
 
     <n-modal v-model:show="showFreezeModal">
       <div class="dialog-card">
